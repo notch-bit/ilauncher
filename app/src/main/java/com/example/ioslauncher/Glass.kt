@@ -69,3 +69,20 @@ fun Modifier.glass(
         ),
         shape
     )
+
+/** Same squircle as [SquircleShape], as an android.graphics.Path (used to bake icons once). */
+fun squirclePath(size: Float, n: Double = 5.0): android.graphics.Path {
+    val r = size / 2f
+    val path = android.graphics.Path()
+    val steps = 120
+    for (i in 0..steps) {
+        val t = 2.0 * PI * i / steps
+        val c = cos(t)
+        val s = sin(t)
+        val x = (r + r * sign(c) * abs(c).pow(2.0 / n)).toFloat()
+        val y = (r + r * sign(s) * abs(s).pow(2.0 / n)).toFloat()
+        if (i == 0) path.moveTo(x, y) else path.lineTo(x, y)
+    }
+    path.close()
+    return path
+}

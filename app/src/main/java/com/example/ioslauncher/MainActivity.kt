@@ -5,6 +5,11 @@ import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.Canvas
+import android.graphics.Paint
+import android.graphics.PorterDuff
+import android.graphics.PorterDuffXfermode
+import android.util.Log
+import java.io.File
 import android.graphics.drawable.AdaptiveIconDrawable
 import android.graphics.drawable.Drawable
 import android.net.Uri
@@ -30,6 +35,10 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -60,6 +69,11 @@ import androidx.core.graphics.drawable.toBitmap
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        val previous = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { t, e ->
+            try { File(filesDir, "crash.txt").writeText(Log.getStackTraceString(e)) } catch (_: Throwable) {}
+            previous?.uncaughtException(t, e)
+        }
         enableEdgeToEdge()
         setContent { LauncherScreen() }
     }
@@ -85,17 +99,32 @@ private fun Drawable.toUniformBitmap(px: Int): Bitmap {
     return toBitmap(px, px)
 }
 
+/** Bakes the squircle mask into the bitmap once, so scrolling never has to clip with a custom path. */
+private fun Bitmap.squircled(): Bitmap {
+    val out = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+    val c = Canvas(out)
+    val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+    c.drawPath(squirclePath(width.toFloat()), paint)
+    paint.xfermode = PorterDuffXfermode(PorterDuff.Mode.SRC_IN)
+    c.drawBitmap(this, 0f, 0f, paint)
+    return out
+}
+
 private fun loadApps(ctx: Context): List<AppInfo> {
     val pm = ctx.packageManager
     val intent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
     return pm.queryIntentActivities(intent, 0)
         .filter { it.activityInfo.packageName != ctx.packageName }
-        .map {
-            AppInfo(
-                label = it.loadLabel(pm).toString(),
-                pkg = it.activityInfo.packageName,
-                icon = it.loadIcon(pm).toUniformBitmap(192).asImageBitmap()
-            )
+        .mapNotNull {
+            try {
+                AppInfo(
+                    label = it.loadLabel(pm).toString(),
+                    pkg = it.activityInfo.packageName,
+                    icon = it.loadIcon(pm).toUniformBitmap(160).squircled().asImageBitmap()
+                )
+            } catch (e: Throwable) {
+                null // one broken icon must never crash the launcher
+            }
         }
         .distinctBy { it.pkg }
         .sortedBy { it.label.lowercase() }
@@ -119,9 +148,13 @@ private fun defaultDock(ctx: Context, apps: List<AppInfo>): List<AppInfo> {
 }
 
 private fun launch(ctx: Context, app: AppInfo) {
-    ctx.packageManager.getLaunchIntentForPackage(app.pkg)?.let {
-        it.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        ctx.startActivity(it)
+    try {
+        ctx.packageManager.getLaunchIntentForPackage(app.pkg)?.let {
+            it.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            ctx.startActivity(it)
+        }
+    } catch (e: Throwable) {
+        // app was removed or can't be opened
     }
 }
 
@@ -134,7 +167,7 @@ private const val ROWS = 6
 fun LauncherScreen() {
     val ctx = LocalContext.current
     var apps by remember { mutableStateOf<List<AppInfo>>(emptyList()) }
-    LaunchedEffect(Unit) { apps = loadApps(ctx) }
+    LaunchedEffect(Unit) { apps = withContext(Dispatchers.Default) { loadApps(ctx) } }
 
     val dock = remember(apps) { if (apps.isEmpty()) emptyList() else defaultDock(ctx, apps) }
     val pages = remember(apps, dock) {
@@ -142,21 +175,26 @@ fun LauncherScreen() {
     }
     var showSearch by remember { mutableStateOf(false) }
     BackHandler(enabled = showSearch) { showSearch = false }
+    var crash by remember {
+        mutableStateOf(try { File(ctx.filesDir, "crash.txt").takeIf { it.exists() }?.readText() } catch (e: Throwable) { null })
+    }
 
     // Real frosted-glass blur of the wallpaper behind the search screen (Android 12+, device permitting).
     LaunchedEffect(showSearch) {
         if (Build.VERSION.SDK_INT >= 31) {
-            (ctx as? Activity)?.window?.let { w ->
-                val lp = w.attributes
-                if (showSearch) {
-                    lp.blurBehindRadius = 70
-                    lp.flags = lp.flags or WindowManager.LayoutParams.FLAG_BLUR_BEHIND
-                } else {
-                    lp.blurBehindRadius = 0
-                    lp.flags = lp.flags and WindowManager.LayoutParams.FLAG_BLUR_BEHIND.inv()
+            try {
+                (ctx as? Activity)?.window?.let { w ->
+                    val lp = w.attributes
+                    if (showSearch) {
+                        lp.blurBehindRadius = 70
+                        lp.flags = lp.flags or WindowManager.LayoutParams.FLAG_BLUR_BEHIND
+                    } else {
+                        lp.blurBehindRadius = 0
+                        lp.flags = lp.flags and WindowManager.LayoutParams.FLAG_BLUR_BEHIND.inv()
+                    }
+                    w.attributes = lp
                 }
-                w.attributes = lp
-            }
+            } catch (e: Throwable) { /* blur not supported on this device */ }
         }
     }
 
@@ -188,6 +226,24 @@ fun LauncherScreen() {
             Spacer(Modifier.height(12.dp))
             Dock(dock) { launch(ctx, it) }
             Spacer(Modifier.height(8.dp))
+        }
+
+        crash?.let { trace ->
+            Column(Modifier.fillMaxSize().background(Color.Black).statusBarsPadding().navigationBarsPadding().padding(16.dp)) {
+                Text("iLauncher crashed last time. Please screenshot this and send it:", color = Color.White, fontSize = 14.sp)
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    trace.take(3000), color = Color(0xFFFF8A80), fontSize = 10.sp,
+                    modifier = Modifier.weight(1f).verticalScroll(rememberScrollState())
+                )
+                Text(
+                    "Dismiss", color = Color(0xFF0A84FF), fontSize = 16.sp,
+                    modifier = Modifier.clickable {
+                        try { File(ctx.filesDir, "crash.txt").delete() } catch (e: Throwable) {}
+                        crash = null
+                    }.padding(12.dp)
+                )
+            }
         }
 
         AnimatedVisibility(showSearch, enter = fadeIn(), exit = fadeOut()) {
@@ -235,7 +291,7 @@ private fun AppIcon(app: AppInfo, showLabel: Boolean, onClick: (AppInfo) -> Unit
         Image(
             bitmap = app.icon,
             contentDescription = app.label,
-            modifier = Modifier.size(62.dp).clip(IconShape) // One UI squircle
+            modifier = Modifier.size(62.dp) // already squircle-shaped
         )
         if (showLabel) {
             Spacer(Modifier.height(6.dp))
@@ -342,7 +398,7 @@ private fun SearchOverlay(apps: List<AppInfo>, onClose: () -> Unit, onOpen: (App
                         .padding(8.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Image(app.icon, app.label, Modifier.size(42.dp).clip(IconShape))
+                    Image(app.icon, app.label, Modifier.size(42.dp))
                     Spacer(Modifier.width(14.dp))
                     Text(app.label, color = Color.White, fontSize = 16.sp)
                 }

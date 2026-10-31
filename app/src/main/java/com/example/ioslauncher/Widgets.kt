@@ -140,7 +140,7 @@ private fun BatteryWidget(modifier: Modifier) {
     var charging by remember { mutableStateOf(false) }
     LaunchedEffect(Unit) {
         while (true) {
-            val i = ctx.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+            val i = try { ctx.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED)) } catch (e: Throwable) { null }
             val l = i?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
             val s = i?.getIntExtra(BatteryManager.EXTRA_SCALE, 100) ?: 100
             if (l >= 0) level = l * 100 / s
@@ -162,7 +162,7 @@ private fun StorageWidget(modifier: Modifier) {
         val st = StatFs(Environment.getDataDirectory().path)
         val total = st.blockCountLong * st.blockSizeLong
         val free = st.availableBlocksLong * st.blockSizeLong
-        (((total - free) * 100) / total).toInt() to free / 1_000_000_000L
+        (if (total > 0) (((total - free) * 100) / total).toInt() else 0) to free / 1_000_000_000L
     }
     RingWidget(modifier, "Storage", usedPct, "$usedPct%", "$freeGb GB free", OneUiBlue)
 }
