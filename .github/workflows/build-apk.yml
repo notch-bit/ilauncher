@@ -18,9 +18,9 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: 8.7
-      - name: Build debug APK
-        run: gradle assembleDebug
+      - name: Build release APK (fast, installable)
+        run: gradle assembleRelease
       - uses: actions/upload-artifact@v4
         with:
-          name: iLauncher-debug-apk
-          path: app/build/outputs/apk/debug/app-debug.apk
+          name: iLauncher-release-apk
+          path: app/build/outputs/apk/release/app-release.apk
