@@ -22,7 +22,7 @@ import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsPressedAsState
@@ -41,14 +41,23 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Shadow
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.boundsInRoot
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -56,8 +65,10 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import java.io.File
+import kotlin.math.roundToInt
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -121,13 +132,97 @@ fun LauncherScreen() {
 
     val columns = settings.columns
     val rows = settings.rows
-    val dock = remember(apps) { if (apps.isEmpty()) emptyList() else defaultDock(ctx, apps) }
-    val pages = remember(apps, dock, columns, rows) {
-        apps.filter { a -> dock.none { it.pkg == a.pkg } }.chunked(columns * rows)
+    val cap = columns * rows
+
+    // Where every app lives (pkg -> slot), including what the user has dragged around.
+    val layout = remember { HomeLayout(ctx) }
+    val byPkg = remember(apps) { apps.associateBy { it.pkg } }
+    val resolved = remember(apps, cap, layout.slots, layout.savedCap) {
+        if (apps.isEmpty()) emptyMap() else layout.resolve(apps, cap, defaultDock(ctx, apps))
+    }
+    val dock = remember(resolved, byPkg) {
+        List(DOCK_SLOTS) { i -> resolved.entries.firstOrNull { it.value == dockSlot(i) }?.key?.let { byPkg[it] } }
     }
 
     var showSearch by remember { mutableStateOf(false) }
     var showSettings by remember { mutableStateOf(false) }
+
+    // Drag & drop state (long-press an icon, then move it anywhere).
+    val haptic = LocalHapticFeedback.current
+    val density = LocalDensity.current
+    var dragPkg by remember { mutableStateOf<String?>(null) }
+    var dragPos by remember { mutableStateOf(Offset.Zero) }
+    var gridRect by remember { mutableStateOf(Rect.Zero) }
+    var dockRect by remember { mutableStateOf(Rect.Zero) }
+
+    val hasToday = settings.showToday
+    val gridPages = if (resolved.isEmpty()) 1 else maxOf(resolved.values.max() / cap + 1, 1)
+    // While dragging, one extra empty page is offered at the end so an icon can start a new page.
+    val appPageCount = gridPages + (if (dragPkg != null) 1 else 0)
+    val pageTotal = appPageCount + (if (hasToday) 1 else 0)
+    val pagerState = key(hasToday) {
+        rememberPagerState(initialPage = if (hasToday) 1 else 0, pageCount = { pageTotal })
+    }
+
+    // Which slot is under a point on screen: a dock slot (negative), a home cell (>= 0) or null.
+    val slotAt = { pos: Offset ->
+        val padH = with(density) { 12.dp.toPx() }
+        val padV = with(density) { 16.dp.toPx() }
+        val dockHit = Rect(
+            dockRect.left, dockRect.top - with(density) { 24.dp.toPx() },
+            dockRect.right, dockRect.bottom + with(density) { 24.dp.toPx() }
+        )
+        val page = pagerState.currentPage - (if (hasToday) 1 else 0)
+        if (dockRect.width > 0f && dockHit.contains(pos)) {
+            val i = ((pos.x - dockRect.left) / (dockRect.width / DOCK_SLOTS)).toInt().coerceIn(0, DOCK_SLOTS - 1)
+            dockSlot(i)
+        } else if (page >= 0 && gridRect.width > 0f) {
+            val inner = Rect(gridRect.left + padH, gridRect.top + padV, gridRect.right - padH, gridRect.bottom - padV)
+            if (inner.width <= 0f || inner.height <= 0f || !inner.contains(pos)) null
+            else {
+                val c = ((pos.x - inner.left) / (inner.width / columns)).toInt().coerceIn(0, columns - 1)
+                val r = ((pos.y - inner.top) / (inner.height / rows)).toInt().coerceIn(0, rows - 1)
+                page * cap + r * columns + c
+            }
+        } else null
+    }
+    val currentSlotAt by rememberUpdatedState(slotAt)
+    val target by remember { derivedStateOf { if (dragPkg == null) null else currentSlotAt(dragPos) } }
+
+    val appAt: (Offset) -> String? = { pos ->
+        currentSlotAt(pos)?.let { s -> resolved.entries.firstOrNull { it.value == s }?.key }
+    }
+    val currentAppAt by rememberUpdatedState(appAt)
+
+    val drop: () -> Unit = {
+        val pkg = dragPkg
+        val t = currentSlotAt(dragPos)
+        dragPkg = null
+        if (pkg != null && t != null) layout.commit(moveToSlot(resolved, pkg, t), cap)
+    }
+    val currentDrop by rememberUpdatedState(drop)
+
+    // Holding an icon near the left/right edge flips to the neighbouring page.
+    val edge by remember(density) {
+        derivedStateOf {
+            val edgePx = with(density) { 44.dp.toPx() }
+            when {
+                dragPkg == null || gridRect.width <= 0f -> 0
+                dragPos.x < gridRect.left + edgePx -> -1
+                dragPos.x > gridRect.right - edgePx -> 1
+                else -> 0
+            }
+        }
+    }
+    LaunchedEffect(edge, pagerState.currentPage) {
+        if (edge != 0) {
+            delay(650)
+            val t = pagerState.currentPage + edge
+            if (t in 0 until pagerState.pageCount) pagerState.animateScrollToPage(t)
+        }
+    }
+
+    val overlayOpen by rememberUpdatedState(showSearch || showSettings)
     BackHandler(enabled = showSettings) { showSettings = false }
     BackHandler(enabled = showSearch && !showSettings) { showSearch = false }
 
@@ -157,7 +252,6 @@ fun LauncherScreen() {
     Box(
         Modifier
             .fillMaxSize()
-            .pointerInput(Unit) { detectTapGestures(onLongPress = { showSettings = true }) }
             .pointerInput(Unit) {
                 var total = 0f
                 detectVerticalDragGestures(
@@ -166,27 +260,59 @@ fun LauncherScreen() {
                     onVerticalDrag = { _, dy -> total += dy }
                 )
             }
+            // Declared after the swipe-down gesture so it wins once a long press has started.
+            // Long-press an icon to pick it up; long-press empty space to open settings.
+            .pointerInput(Unit) {
+                detectDragGesturesAfterLongPress(
+                    onDragStart = { off ->
+                        if (!overlayOpen) {
+                            val pkg = currentAppAt(off)
+                            if (pkg != null) {
+                                dragPkg = pkg
+                                dragPos = off
+                                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                            } else {
+                                showSettings = true
+                            }
+                        }
+                    },
+                    onDrag = { change, amount ->
+                        if (dragPkg != null) {
+                            change.consume()
+                            dragPos += amount
+                        }
+                    },
+                    onDragEnd = { currentDrop() },
+                    onDragCancel = { dragPkg = null }
+                )
+            }
     ) {
         Column(Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding()) {
             // Today page (widgets) is page 0 when enabled; app pages follow.
-            val hasToday = settings.showToday
-            val pageTotal = maxOf(pages.size, 1) + (if (hasToday) 1 else 0)
-            val pagerState = key(hasToday) {
-                rememberPagerState(initialPage = if (hasToday) 1 else 0, pageCount = { pageTotal })
-            }
-
             HorizontalPager(
                 state = pagerState,
-                modifier = Modifier.weight(1f).fillMaxWidth()
+                userScrollEnabled = dragPkg == null,
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth()
+                    .onGloballyPositioned { gridRect = it.boundsInRoot() }
             ) { page ->
                 if (hasToday && page == 0) {
                     TodayPage(settings.widgets, onSearch = { showSearch = true })
                 } else {
                     val appPage = page - (if (hasToday) 1 else 0)
+                    val cells = remember(resolved, byPkg, appPage, cap) {
+                        resolved.entries
+                            .filter { it.value >= 0 && it.value / cap == appPage }
+                            .mapNotNull { e -> byPkg[e.key]?.let { (e.value % cap) to it } }
+                            .toMap()
+                    }
+                    val highlight = target?.takeIf { it >= 0 && it / cap == appPage }?.let { it % cap }
                     IconGrid(
-                        items = pages.getOrNull(appPage).orEmpty(),
+                        cells = cells,
                         columns = columns, rows = rows,
-                        iconSize = settings.iconSize, showLabels = settings.showLabels
+                        iconSize = settings.iconSize, showLabels = settings.showLabels,
+                        hiddenPkg = dragPkg, highlightCell = highlight
                     ) { launch(ctx, it) }
                 }
             }
@@ -197,8 +323,28 @@ fun LauncherScreen() {
                 onSettings = { showSettings = true }
             )
             Spacer(Modifier.height(12.dp))
-            Dock(dock, settings.iconSize) { launch(ctx, it) }
+            Dock(
+                dock, settings.iconSize,
+                hiddenPkg = dragPkg,
+                highlightSlot = target?.takeIf { it < 0 },
+                onBounds = { dockRect = it }
+            ) { launch(ctx, it) }
             Spacer(Modifier.height(8.dp))
+        }
+
+        // The icon being dragged, following the finger.
+        val dragged = dragPkg?.let { byPkg[it] }
+        if (dragged != null) {
+            val sizePx = with(density) { settings.iconSize.dp.toPx() }
+            Image(
+                bitmap = dragged.icon,
+                contentDescription = null,
+                modifier = Modifier
+                    .offset { IntOffset((dragPos.x - sizePx / 2).roundToInt(), (dragPos.y - sizePx / 2).roundToInt()) }
+                    .size(settings.iconSize.dp)
+                    .scale(1.2f)
+                    .alpha(0.95f)
+            )
         }
 
         AnimatedVisibility(showSearch, enter = fadeIn(), exit = fadeOut()) {
@@ -213,7 +359,11 @@ fun LauncherScreen() {
             enter = slideInVertically { it } + fadeIn(),
             exit = slideOutVertically { it } + fadeOut()
         ) {
-            SettingsScreen(settings, onClose = { showSettings = false })
+            SettingsScreen(
+                settings,
+                onClose = { showSettings = false },
+                onResetPositions = { layout.reset() }
+            )
         }
 
         crash?.let { trace ->
@@ -243,16 +393,26 @@ fun LauncherScreen() {
 
 @Composable
 private fun IconGrid(
-    items: List<AppInfo>, columns: Int, rows: Int,
-    iconSize: Int, showLabels: Boolean, onClick: (AppInfo) -> Unit
+    cells: Map<Int, AppInfo>, columns: Int, rows: Int,
+    iconSize: Int, showLabels: Boolean,
+    hiddenPkg: String?, highlightCell: Int?,
+    onClick: (AppInfo) -> Unit
 ) {
     Column(Modifier.fillMaxSize().padding(horizontal = 12.dp, vertical = 16.dp)) {
         for (r in 0 until rows) {
             Row(Modifier.weight(1f).fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                 for (c in 0 until columns) {
-                    val app = items.getOrNull(r * columns + c)
-                    Box(Modifier.weight(1f), contentAlignment = Alignment.Center) {
-                        if (app != null) AppIcon(app, iconSize, showLabels, onClick)
+                    val index = r * columns + c
+                    val app = cells[index]
+                    Box(
+                        Modifier
+                            .weight(1f)
+                            .padding(2.dp)
+                            .clip(RoundedCornerShape(18.dp))
+                            .background(if (highlightCell == index) Color.White.copy(alpha = 0.18f) else Color.Transparent),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        if (app != null) AppIcon(app, iconSize, showLabels, app.pkg == hiddenPkg, onClick)
                     }
                 }
             }
@@ -261,13 +421,14 @@ private fun IconGrid(
 }
 
 @Composable
-private fun AppIcon(app: AppInfo, size: Int, showLabel: Boolean, onClick: (AppInfo) -> Unit) {
+private fun AppIcon(app: AppInfo, size: Int, showLabel: Boolean, hidden: Boolean, onClick: (AppInfo) -> Unit) {
     val source = remember { MutableInteractionSource() }
     val pressed by source.collectIsPressedAsState()
     val scale by animateFloatAsState(if (pressed) 0.9f else 1f, label = "press")
 
     Column(
         Modifier
+            .alpha(if (hidden) 0f else 1f)
             .scale(scale)
             .clickable(interactionSource = source, indication = null) { onClick(app) },
         horizontalAlignment = Alignment.CenterHorizontally
@@ -320,16 +481,32 @@ private fun PageDots(count: Int, current: Int, onSettings: () -> Unit) {
 /* ---------- Dock (glass) ---------- */
 
 @Composable
-private fun Dock(apps: List<AppInfo>, iconSize: Int, onClick: (AppInfo) -> Unit) {
+private fun Dock(
+    apps: List<AppInfo?>, iconSize: Int,
+    hiddenPkg: String?, highlightSlot: Int?,
+    onBounds: (Rect) -> Unit,
+    onClick: (AppInfo) -> Unit
+) {
     Row(
         Modifier
             .padding(horizontal = 12.dp)
             .fillMaxWidth()
             .glass(RoundedCornerShape(34.dp))
-            .padding(horizontal = 12.dp, vertical = 14.dp),
-        horizontalArrangement = Arrangement.SpaceAround
+            .padding(horizontal = 12.dp, vertical = 14.dp)
+            .onGloballyPositioned { onBounds(it.boundsInRoot()) }
     ) {
-        apps.forEach { AppIcon(it, iconSize, false, onClick) }
+        apps.forEachIndexed { i, app ->
+            Box(
+                Modifier
+                    .weight(1f)
+                    .height(iconSize.dp)
+                    .clip(RoundedCornerShape(16.dp))
+                    .background(if (highlightSlot == dockSlot(i)) Color.White.copy(alpha = 0.18f) else Color.Transparent),
+                contentAlignment = Alignment.Center
+            ) {
+                if (app != null) AppIcon(app, iconSize, false, app.pkg == hiddenPkg, onClick)
+            }
+        }
     }
 }
 

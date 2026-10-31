@@ -81,7 +81,7 @@ private val Muted = Color.White.copy(alpha = 0.6f)
 private val Green = Color(0xFF30D158)
 
 @Composable
-fun SettingsScreen(settings: LauncherSettings, onClose: () -> Unit) {
+fun SettingsScreen(settings: LauncherSettings, onClose: () -> Unit, onResetPositions: () -> Unit = {}) {
     val ctx = LocalContext.current
     var packs by remember { mutableStateOf<List<IconPack>>(emptyList()) }
     LaunchedEffect(Unit) { packs = withContext(Dispatchers.Default) { loadPacks(ctx) } }
@@ -184,9 +184,19 @@ fun SettingsScreen(settings: LauncherSettings, onClose: () -> Unit) {
                     color = Muted, fontSize = 12.sp
                 )
                 Text(
+                    "Long-press an icon to pick it up, then drag it anywhere. Hold it at the screen edge to " +
+                        "change page, or drop it on a page's empty space to move it there.",
+                    color = Muted, fontSize = 12.sp
+                )
+                Text(
                     "Reset layout & icon size",
                     color = Color(0xFF0A84FF), fontSize = 15.sp,
                     modifier = Modifier.clickable { settings.resetLayout() }.padding(vertical = 4.dp)
+                )
+                Text(
+                    "Reset icon positions",
+                    color = Color(0xFF0A84FF), fontSize = 15.sp,
+                    modifier = Modifier.clickable { onResetPositions() }.padding(vertical = 4.dp)
                 )
             }
 
