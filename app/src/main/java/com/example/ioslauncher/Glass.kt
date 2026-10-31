@@ -86,3 +86,32 @@ fun squirclePath(size: Float, n: Double = 5.0): android.graphics.Path {
     path.close()
     return path
 }
+
+/** Icon shapes the user can pick in Launcher settings. */
+enum class IconShapeType(val label: String) {
+    SQUIRCLE("Squircle"), CIRCLE("Circle"), ROUNDED("Rounded"), SQUARE("Square"), TEARDROP("Teardrop");
+
+    companion object {
+        fun from(name: String?): IconShapeType = values().firstOrNull { it.name == name } ?: SQUIRCLE
+    }
+}
+
+fun shapePath(type: IconShapeType, size: Float): android.graphics.Path {
+    val cw = android.graphics.Path.Direction.CW
+    return when (type) {
+        IconShapeType.SQUIRCLE -> squirclePath(size)
+        IconShapeType.CIRCLE -> android.graphics.Path().apply { addOval(0f, 0f, size, size, cw) }
+        IconShapeType.ROUNDED -> android.graphics.Path().apply {
+            addRoundRect(0f, 0f, size, size, size * 0.24f, size * 0.24f, cw)
+        }
+        IconShapeType.SQUARE -> android.graphics.Path().apply {
+            addRoundRect(0f, 0f, size, size, size * 0.06f, size * 0.06f, cw)
+        }
+        IconShapeType.TEARDROP -> android.graphics.Path().apply {
+            val r = size * 0.5f
+            val s = size * 0.1f
+            // radii order: top-left, top-right, bottom-right, bottom-left (x,y each)
+            addRoundRect(android.graphics.RectF(0f, 0f, size, size), floatArrayOf(r, r, r, r, s, s, r, r), cw)
+        }
+    }
+}

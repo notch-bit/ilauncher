@@ -1,9 +1,12 @@
-# iLauncher – iOS + One UI inspired Android launcher (Kotlin + Jetpack Compose)
+# iLauncher alpha 1.0.0 – iOS + One UI + Nothing inspired launcher (Kotlin + Jetpack Compose)
 
-1. Open this folder in Android Studio (Koala or newer). Let Gradle sync.
-2. Run on a device/emulator (API 26+).
-3. Press Home -> choose "iLauncher" -> "Always" to set it as your launcher.
+Made by Jay.
 
-- Swipe right from the first app page for the Today widgets (clock, battery, storage, calendar).
-- Pull down for glass search (real wallpaper blur on Android 12+ devices that allow it).
-- All icons are drawn in a uniform One UI-style squircle.
+1. Open in Android Studio (or build with the GitHub Actions workflow).
+2. Install, press Home -> choose "iLauncher" -> "Always".
+
+Launcher settings: tap the gear next to the page dots, or long-press an empty part of the home screen.
+- Icons: size, shape (squircle, circle, rounded, square, teardrop), icon packs (ADW/Nova/Apex)
+- Home screen layout: columns, rows, app names, Today page
+- Widgets: Apple, One UI and Nothing styles
+- About: version and credits
